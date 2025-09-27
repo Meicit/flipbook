@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>PDF → Flipbook</title>
+
+  <!-- Turn.js (page flip) - if CDN blocked, download turn.min.js và sửa src -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/turn.js/3/turn.min.js"></script>
+
+  <!-- PDF.js (mozilla) - nếu CDN khác bạn có thể thay) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+
+  <style>
+    :root{
+      --page-width: 520px;
+      --page-height: 720px;
+      --gap: 12px;
+    }
+    body {
+      font-family: Arial, sans-serif;
+      display:flex;
+      flex-direction:column;
+      align-items:center;
+      gap:12px;
+      padding:20px;
+      background: #f0f2f5;
+    }
+    #controls {
+      display:flex;
+      gap:8px;
+      align-items:center;
+    }
+    #flipbook {
+      width: calc(var(--page-width) * 2 + var(--gap));
+      height: var(--page-height);
+      margin: 8px 0;
+    }
+
+    /* Turn.js needs pages as direct children */
+    .page {
+      width: var(--page-width);
+      height: var(--page-height);
+      background: white;
+      box-shadow: 0 6px 18px rgba(0,0,0,0.2);
+      overflow: hidden;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+    }
+
+    /* Canvas inside page should fill */
+    .page canvas {
+      width:100%;
+      height:100%;
+      display:block;
+    }
+
+    /* Responsive */
+    @media (max-width: 1200px) {
+      :root{
+        --page-width: 360px;
+        --page-height: 500px;
+      }
+      #flipbook {
+        width: calc(var(--page-width) * 2 + var(--gap));
+      }
+    }
+
+    /* Small hint */
+    .hint { font-size: 13px; color: #555; }
+  </style>
+</head>
+<body>
+  <h2>PDF → Flipbook (HTML + PDF.js + Turn.js)</h2>
+
+  <div id="controls">
+    <label>
+      Chọn PDF:
+      <input id="file-input" type="file" accept="application/pdf">
+    </label>
+    <button id="prevBtn">⟨ Prev</button>
+    <button id="nextBtn">Next ⟩</button>
+    <span class="hint"> (Bạn cũng có thể để file PDF tên <code>sample.pdf</code> trong cùng thư mục và click Load)</span>
+  </div>
+
+  <div id="flipbook"></div>
+
+  <div>
+    <button id="loadSample">Load sample.pdf</button>
+    <span id="status" class="hint"></span>
+  </div>
+
+<script>
+/*
+  Hướng dẫn ngắn:
+  - Mở bằng server (ví dụ: python -m http.server 8000) rồi truy cập http://localhost:8000/flipbook.html
+  - Nếu muốn load file local mà không qua input file, đổi PDF_URL thành đường dẫn đúng và đảm bảo server cho phép.
+  - Turn.js: nếu CDN không load, tải turn.min.js và sửa đường dẫn <script> phía trên.
+*/
+
+const PDFJS = window['pdfjs-dist/build/pdf'] || window['pdfjs-dist/build/pdf.js'] || window['pdfjs-dist'];
+// If loaded via cdnjs, pdfjs exposes global 'pdfjsLib'
+const pdfjsLib = window['pdfjsLib'] || PDFJS || window.pdfjsLib;
+
+// nếu pdfjsLib tồn tại, set workerSrc nếu cần
+if (pdfjsLib && !pdfjsLib.GlobalWorkerOptions?.workerSrc) {
+  // mặc định dùng CDN worker (nếu không muốn, tải worker và sửa đường dẫn)
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+}
+
+const flipbookEl = document.getElementById('flipbook');
+const statusEl = document.getElementById('status');
+
+let pdfDoc = null;
+let numPages = 0;
+let pagesRendered = 0;
+let pageElements = []; // lưu element page
+
+// tạo element page chứa canvas
+function makePageElement(index) {
+  const pageDiv = document.createElement('div');
+  pageDiv.className = 'page';
+  pageDiv.dataset.page = index;
+  const canvas = document.createElement('canvas');
+  canvas.dataset.page = index;
+  pageDiv.appendChild(canvas);
+  return pageDiv;
+}
+
+// render 1 trang PDF vào canvas (index bắt đầu từ 1)
+async function renderPage(pageNum) {
+  const page = await pdfDoc.getPage(pageNum);
+  const viewport = page.getViewport({ scale: 1.5 }); // scale cơ bản
+  const canvas = document.querySelector('canvas[data-page="'+pageNum+'"]');
+  // tính scale để canvas phù hợp với kích thước đặt sẵn
+  const maxW = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--page-width'));
+  const scale = (maxW / viewport.width) * 1.0 *  (viewport.width/viewport.width);
+  const scaledViewport = page.getViewport({ scale: scale });
+  canvas.width = scaledViewport.width;
+  canvas.height = scaledViewport.height;
+  const ctx = canvas.getContext('2d');
+  await page.render({ canvasContext: ctx, viewport: scaledViewport }).promise;
+}
+
+// sau khi render xong tất cả trang, khởi tạo turn.js
+function initTurn() {
+  // destroy nếu đã khởi tạo
+  if ($(flipbookEl).data('turn')) {
+    $(flipbookEl).turn('destroy').empty();
+  }
+  // ensure even number of pages (turn.js thích chẵn)
+  if (pageElements.length % 2 !== 0) {
+    // thêm 1 trang trắng cuối cùng
+    const blank = document.createElement('div');
+    blank.className = 'page';
+    pageElements.push(blank);
+  }
+  // append pages
+  flipbookEl.innerHTML = '';
+  for (const p of pageElements) flipbookEl.appendChild(p);
+
+  // khởi tạo turn
+  $(flipbookEl).turn({
+    width: parseInt(getComputedStyle(document.documentElement).getPropertyValue('--page-width')) * 2 + 12,
+    height: parseInt(getComputedStyle(document.documentElement).getPropertyValue('--page-height')),
+    autoCenter: true,
+    elevation: 50,
+    gradients: true,
+    duration: 800
+  });
+
+  // nút prev/next
+  document.getElementById('prevBtn').onclick = () => $(flipbookEl).turn('previous');
+  document.getElementById('nextBtn').onclick = () => $(flipbookEl).turn('next');
+}
+
+// load PDF từ URL hoặc File
+async function loadPDFFromURL(url) {
+  statusEl.textContent = 'Đang tải PDF...';
+  try {
+    const loadingTask = pdfjsLib.getDocument(url);
+    pdfDoc = await loadingTask.promise;
+    numPages = pdfDoc.numPages;
+    statusEl.textContent = `PDF tải xong — ${numPages} trang. Đang render...`;
+    // tạo pageElements
+    pageElements = [];
+    for (let i = 1; i <= numPages; i++) {
+      pageElements.push(makePageElement(i));
+    }
+    // render từng trang (song song nhưng giới hạn)
+    const renderPromises = [];
+    for (let i = 1; i <= numPages; i++) {
+      renderPromises.push(renderPage(i));
+    }
+    await Promise.all(renderPromises);
+    statusEl.textContent = 'Render xong — khởi tạo flipbook.';
+    initTurn();
+    statusEl.textContent = 'Sẵn sàng.';
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = 'Lỗi khi tải PDF: ' + err.message;
+  }
+}
+
+async function loadPDFFromFile(file) {
+  statusEl.textContent = 'Đang đọc file...';
+  const arrayBuffer = await file.arrayBuffer();
+  const loadingTask = pdfjsLib.getDocument({data: arrayBuffer});
+  try {
+    pdfDoc = await loadingTask.promise;
+    numPages = pdfDoc.numPages;
+    statusEl.textContent = `PDF tải xong — ${numPages} trang. Đang render...`;
+    pageElements = [];
+    for (let i = 1; i <= numPages; i++) {
+      pageElements.push(makePageElement(i));
+    }
+    const renderPromises = [];
+    for (let i = 1; i <= numPages; i++) renderPromises.push(renderPage(i));
+    await Promise.all(renderPromises);
+    initTurn();
+    statusEl.textContent = 'Sẵn sàng (file local).';
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = 'Lỗi render file: ' + err.message;
+  }
+}
+
+// events
+document.getElementById('file-input').addEventListener('change', (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  loadPDFFromFile(f);
+});
+
+document.getElementById('loadSample').addEventListener('click', () => {
+  // mặc định tìm sample.pdf ở cùng thư mục
+  const defaultUrl = 'sample.pdf';
+  loadPDFFromURL(defaultUrl);
+});
+
+// nếu muốn tự load một URL cụ thể, có thể gọi loadPDFFromURL('https://domain/.../file.pdf');
+
+</script>
+
+<!-- jQuery vì turn.js 3.x cần jQuery -->
+<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+
+</body>
+</html>
